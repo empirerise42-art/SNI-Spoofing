@@ -1,4 +1,15 @@
-# SNI Proxy Scanner - نسخه ویندوز 7
+# SNI Proxy Scanner - نسخه حرفه‌ای
+
+## ویژگی‌های جدید
+- ✅ لیست 2000 دامنه Cloudflare
+- ✅ اسکن عمیق TLS/SSL (گواهی، ALPN، نسخه TLS)
+- ✅ تشخیص امضای CDN از HTTP headers (CF-Ray)
+- ✅ تایم‌اوت 2 ثانیه
+- ✅ نمایش فقط Cloudflare مرتب بر اساس پینگ
+- ✅ فیلتر زنده در جدول
+- ✅ آمار کامل (آنلاین، CF‌ها، بهترین)
+- ✅ بارگذاری دستی لیست دامنه
+- ✅ کپی/پیست دستی SNI سرور
 
 ## نصب
 pip install -r requirements.txt
@@ -7,6 +18,5 @@ pip install -r requirements.txt
 python main.py
 
 ## سیستم موردنیاز
-- Windows 7 SP1 / Windows 8 / Windows 10
-- Python 3.6+
-- WinDivert (اختیاری برای DPI bypass)
+- Windows 10/11
+- Python 3.10+

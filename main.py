@@ -1,5 +1,4 @@
 import asyncio
-from typing import Optional
 import os
 import socket
 import struct
@@ -241,9 +240,9 @@ class App(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.server_socket: object = None
+        self.server_socket: socket.socket | None = None
         self._stop_scan   = threading.Event()
-        self._scan_thread: object = None
+        self._scan_thread: threading.Thread | None = None
         self._scan_results: list[dict] = []
         self._cf_only_mode = tk.BooleanVar(value=False)
         self._deep_scan    = tk.BooleanVar(value=True)
@@ -828,7 +827,7 @@ class App(ctk.CTk):
             self.btn_proxy.configure(text="🛑  توقف پروکسی",
                                      fg_color="#922b21", hover_color="#7b241c")
             threading.Thread(
-                target=lambda: self._run_asyncio_loop(cfg, local_ip),
+                target=lambda: asyncio.run(self._run_srv(cfg, local_ip)),
                 daemon=True).start()
 
             if WINDIVERT_OK:
@@ -857,15 +856,6 @@ class App(ctk.CTk):
                                      fg_color="#1e8449", hover_color="#145a32")
             gui_log("System", "پروکسی متوقف شد.", "WARNING")
             self._set_status("پروکسی متوقف شد — آماده راه‌اندازی مجدد")
-
-
-    def _run_asyncio_loop(self, config, local_ip):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._run_srv(config, local_ip))
-        finally:
-            loop.close()
 
     async def _run_srv(self, config, _):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
