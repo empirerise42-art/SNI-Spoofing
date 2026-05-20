@@ -9,15 +9,19 @@ import queue
 import time
 import ipaddress
 import tkinter as tk
+import tkinter.font as tkfont
 import customtkinter as ctk
 from tkinter import ttk, messagebox, filedialog
+from concurrent.futures import ThreadPoolExecutor
 
-# ── تنظیمات پایه ─────────────────────────────────────────────────────────────
+# ── تنظیمات پایه ──────────────────────────────────────────────────────────────
 socket.setdefaulttimeout(3.0)
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-# ── دیتابیس CDN و امضاهای DNS ────────────────────────────────────────────────
+SCAN_WORKERS    = 50   # تعداد thread های موازی اسکن
+PING_TIMEOUT    = 1.0  # ثانیه
+
 IP_DATABASE = {
     "☁️ Cloudflare":   ["103.21.244.0/22","104.16.0.0/13","108.162.192.0/18","172.64.0.0/13","188.114.96.0/20"],
     "⚡ ArvanCloud":   ["185.143.232.0/22","94.182.160.0/19","185.176.4.0/22"],
@@ -30,18 +34,16 @@ IP_DATABASE = {
 }
 
 DNS_SIGNATURES = {
-    "amazonaws.com":       "📦 Amazon AWS",
-    "digitalocean.com":    "💧 DigitalOcean",
-    "vultr.com":           "🦅 Vultr",
-    "hetzner.com":         "🇩🇪 Hetzner",
-    "linode.com":          "🟢 Linode",
-    "googleusercontent.com": "🔍 Google Cloud",
-    "arvancloud":          "⚡ ArvanCloud",
-    "cloudflare.com":      "☁️ Cloudflare",
-    "fastly.net":          "🚀 Fastly",
+    "amazonaws.com":          "📦 Amazon AWS",
+    "digitalocean.com":       "💧 DigitalOcean",
+    "vultr.com":              "🦅 Vultr",
+    "hetzner.com":            "🇩🇪 Hetzner",
+    "linode.com":             "🟢 Linode",
+    "googleusercontent.com":  "🔍 Google Cloud",
+    "arvancloud":             "⚡ ArvanCloud",
+    "cloudflare.com":         "☁️ Cloudflare",
+    "fastly.net":             "🚀 Fastly",
 }
-
-QUALITY_THRESHOLDS = {"excellent": 150, "good": 300, "slow": 500}
 
 def detect_provider(ip_str: str) -> str:
     try:
@@ -54,17 +56,15 @@ def detect_provider(ip_str: str) -> str:
         pass
     try:
         hostname, _, _ = socket.gethostbyaddr(ip_str)
-        hostname = hostname.lower()
+        h = hostname.lower()
         for sig, name in DNS_SIGNATURES.items():
-            if sig in hostname:
-                return f"{name} (DNS)"
-        parts = hostname.split(".")
-        short = ".".join(parts[-2:]) if len(parts) >= 2 else hostname
-        return f"🌐 {short}"
+            if sig in h:
+                return f"{name}"
+        parts = h.split(".")
+        return f"🌐 {'.'.join(parts[-2:]) if len(parts)>=2 else h}"
     except OSError:
-        return "❓ Unknown"
+        return "❓ ناشناخته"
 
-# ── توابع کمکی ───────────────────────────────────────────────────────────────
 def get_exe_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -72,20 +72,19 @@ def get_exe_dir() -> str:
 
 LOG_FILE_PATH = os.path.join(get_exe_dir(), "debug.log")
 
-def write_to_log_file(msg: str):
+def write_log(msg: str):
     try:
         with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} — {msg}\n")
     except OSError:
         pass
 
-def get_tcp_ping(ip: str, port: int = 443, timeout: float = 1.5) -> int:
-    """TCP latency measurement (avoids ICMP restrictions)."""
+def tcp_ping(ip: str, port: int = 443) -> int:
     try:
-        start = time.perf_counter()
-        with socket.create_connection((ip, port), timeout=timeout):
+        t = time.perf_counter()
+        with socket.create_connection((ip, port), timeout=PING_TIMEOUT):
             pass
-        return int((time.perf_counter() - start) * 1000)
+        return int((time.perf_counter() - t) * 1000)
     except OSError:
         return 999
 
@@ -97,19 +96,22 @@ def get_local_ip() -> str:
     except OSError:
         return "127.0.0.1"
 
-def quality_label(ping: int) -> str:
-    if ping == 999:   return "🔴 آفلاین"
-    if ping > QUALITY_THRESHOLDS["slow"]:   return "🟠 ضعیف"
-    if ping > QUALITY_THRESHOLDS["good"]:   return "🟡 متوسط"
-    if ping > QUALITY_THRESHOLDS["excellent"]: return "🟢 خوب"
-    return "⚡ عالی"
+def ping_tag(ping: int) -> str:
+    if ping == 999:   return "offline"
+    if ping > 400:    return "slow"
+    if ping > 200:    return "good"
+    return "excellent"
 
-# ── هسته TLS / SNI Spoofing ──────────────────────────────────────────────────
+def ping_label(ping: int) -> str:
+    t = ping_tag(ping)
+    return {"excellent":"⚡ عالی","good":"🟢 خوب","slow":"🟡 کند","offline":"🔴 آفلاین"}[t]
+
+# ── TLS / SNI ──────────────────────────────────────────────────────────────────
 try:
     from fake_tcp import FakeInjectiveConnection, FakeTcpInjector
-    WINDIVERT_AVAILABLE = True
+    WINDIVERT_OK = True
 except ImportError:
-    WINDIVERT_AVAILABLE = False
+    WINDIVERT_OK = False
 
 class ClientHelloMaker:
     _raw = (
@@ -122,251 +124,294 @@ class ClientHelloMaker:
         "73e2338770efdaa98693d217001500d50000000000000000000000000000000000000000000000000000000000000000"
         "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
         "000000000000000000000000000000000000000000000000000000000000000000000000"
-    ).replace("\n", "")
-    tls_ch_template = bytes.fromhex(_raw if len(_raw) % 2 == 0 else _raw + "0")
-    template_sni = b"mci.ir"
+    ).replace("\n","")
+    tls_ch_template = bytes.fromhex(_raw if len(_raw)%2==0 else _raw+"0")
+    template_sni    = b"mci.ir"
 
     @classmethod
-    def get_client_hello_with(cls, rnd: bytes, sess_id: bytes, target_sni: bytes, key_share: bytes) -> bytes:
-        s1 = cls.tls_ch_template[:11]
-        s3 = cls.tls_ch_template[76:120]
-        s4 = cls.tls_ch_template[127 + len(cls.template_sni): 262 + len(cls.template_sni)]
-        sni_len   = len(target_sni)
-        sn_ext    = struct.pack("!H", sni_len + 5) + struct.pack("!H", sni_len + 3) + b"\x00" + struct.pack("!H", sni_len) + target_sni
-        pad_size  = max(0, 219 - sni_len)
-        pad_ext   = struct.pack("!H", pad_size) + (b"\x00" * pad_size)
-        return s1 + rnd + b"\x20" + sess_id + s3 + sn_ext + s4 + key_share + b"\x00\x15" + pad_ext
+    def get_client_hello_with(cls, rnd, sess_id, target_sni, key_share):
+        s1  = cls.tls_ch_template[:11]
+        s3  = cls.tls_ch_template[76:120]
+        s4  = cls.tls_ch_template[127+len(cls.template_sni):262+len(cls.template_sni)]
+        n   = len(target_sni)
+        sne = struct.pack("!H",n+5)+struct.pack("!H",n+3)+b"\x00"+struct.pack("!H",n)+target_sni
+        ps  = max(0, 219-n)
+        pad = struct.pack("!H",ps)+(b"\x00"*ps)
+        return s1+rnd+b"\x20"+sess_id+s3+sne+s4+key_share+b"\x00\x15"+pad
 
-# ── متغیرهای سراسری ──────────────────────────────────────────────────────────
+# ── سراسری ──────────────────────────────────────────────────────────────────
 log_queue: queue.Queue = queue.Queue()
 async_loop_running     = False
 fake_injective_connections: dict = {}
 active_divert_ips: set = set()
 
-LEVEL_ICONS = {
-    "INFO":    "ℹ️",
-    "SUCCESS": "✅",
-    "ERROR":   "❌",
-    "WARNING": "⚠️",
-    "Scanner": "🔍",
-    "DPI":     "🛡️",
-    "Relay":   "⚡",
-}
+def gui_log(src: str, msg: str, level: str = "INFO"):
+    icons = {"INFO":"ℹ️","SUCCESS":"✅","ERROR":"❌","WARNING":"⚠️",
+             "Scanner":"🔍","DPI":"🛡️","Relay":"⚡","Client":"👤","Proxy":"🔀","Config":"⚙️"}
+    icon = icons.get(level if level in icons else src, "🔹")
+    log_queue.put((time.strftime("%H:%M:%S"), level, src, f"{icon} {msg}"))
+    write_log(f"[{level}] {src}: {msg}")
 
-def gui_log(source: str, message: str, level: str = "INFO"):
-    icon = LEVEL_ICONS.get(level if level in LEVEL_ICONS else source, "🔹")
-    log_queue.put((time.strftime("%H:%M:%S"), level, source, f"{icon} {message}"))
-    write_to_log_file(f"[{level}] {source}: {message}")
-
-# ── رابط کاربری ─────────────────────────────────────────────────────────────
-class ModernProxyGUI(ctk.CTk):
+# ── رابط کاربری ──────────────────────────────────────────────────────────────
+class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("SNI Proxy v3.6  —  TCP Scanner & DPI Bypass")
-        self.geometry("1300x780")
-        self.minsize(900, 600)
+        self.title("SNI Proxy  —  اسکنر TCP و دور زدن DPI")
+        self.geometry("1350x820")
+        self.minsize(960, 640)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
         self.server_socket: socket.socket | None = None
+        self._stop_scan   = threading.Event()
         self._scan_thread: threading.Thread | None = None
-        self._stop_scan = threading.Event()
+        self._scan_results: list[dict] = []   # برای کپی
 
         self._build_sidebar()
-        self._build_main_area()
+        self._build_main()
         self.after(100, self._poll_logs)
 
-    # ── sidebar ──────────────────────────────────────────────────────────────
+    # ═══════════════════════════ SIDEBAR ═════════════════════════════════════
     def _build_sidebar(self):
-        sb = ctk.CTkFrame(self, width=290, corner_radius=0, fg_color="#1a1a2e")
+        sb = ctk.CTkFrame(self, width=300, corner_radius=0, fg_color="#12121e")
         sb.grid(row=0, column=0, sticky="nsew")
         sb.grid_propagate(False)
+        sb.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(sb, text="🛡️ SNI PROXY", font=ctk.CTkFont(size=22, weight="bold"),
-                     text_color="#00d2ff").grid(row=0, column=0, padx=20, pady=(30, 4))
-        ctk.CTkLabel(sb, text="TCP Scanner & DPI Bypass", font=ctk.CTkFont(size=11),
-                     text_color="#888").grid(row=1, column=0, padx=20, pady=(0, 24))
+        # عنوان
+        ctk.CTkLabel(sb, text="🛡️ SNI PROXY",
+                     font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
+                     text_color="#00cfff").grid(row=0, column=0, pady=(28,2))
+        ctk.CTkLabel(sb, text="دور زدن DPI  |  اسکنر TCP",
+                     font=ctk.CTkFont(size=11), text_color="#556").grid(row=1, column=0, pady=(0,18))
 
-        # ── Config box ──────────────────────────────────────────────────────
-        box = ctk.CTkFrame(sb, fg_color="#252540", corner_radius=10)
-        box.grid(row=2, column=0, padx=16, pady=4, sticky="ew")
-        ctk.CTkLabel(box, text="⚙️ تنظیمات", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="w")
+        # ── باکس کانفیگ ──────────────────────────────────────────────────────
+        box = ctk.CTkFrame(sb, fg_color="#1c1c30", corner_radius=10)
+        box.grid(row=2, column=0, padx=14, pady=2, sticky="ew")
+        box.grid_columnconfigure(0, weight=1)
 
-        for r, (lbl, attr, placeholder) in enumerate([
-            ("SNI جعلی",    "entry_sni",  "e.g. auth.vercel.com"),
-            ("IP اتصال",    "entry_ip",   "e.g. 188.114.98.0"),
-            ("پورت محلی",  "entry_port", "40443"),
-        ], start=1):
-            ctk.CTkLabel(box, text=lbl, font=ctk.CTkFont(size=11), text_color="#aaa").grid(
-                row=r*2-1, column=0, padx=12, pady=(4, 0), sticky="w")
-            e = ctk.CTkEntry(box, placeholder_text=placeholder, width=240)
-            e.grid(row=r*2, column=0, padx=12, pady=(0, 6), sticky="ew")
+        ctk.CTkLabel(box, text="⚙️  تنظیمات اتصال",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#aaa").grid(row=0, column=0, padx=14, pady=(12,4), sticky="w")
+
+        fields = [
+            ("SNI جعلی",   "e_sni",  "hcaptcha.com",    "FAKE_SNI"),
+            ("IP سرور",    "e_ip",   "104.19.229.21",   "CONNECT_IP"),
+            ("پورت محلی",  "e_port", "40443",           "LISTEN_PORT"),
+        ]
+        self._field_map = {}
+        for i,(lbl,attr,ph,key) in enumerate(fields, start=1):
+            ctk.CTkLabel(box, text=lbl, font=ctk.CTkFont(size=11), text_color="#888").grid(
+                row=i*2-1, column=0, padx=14, pady=(4,0), sticky="w")
+            e = ctk.CTkEntry(box, placeholder_text=ph, height=32,
+                             font=ctk.CTkFont(family="Consolas", size=12))
+            e.grid(row=i*2, column=0, padx=14, pady=(0,4), sticky="ew")
             setattr(self, attr, e)
+            self._field_map[attr] = key
 
         self._load_config_to_ui()
 
-        btn_save = ctk.CTkButton(box, text="💾 ذخیره تنظیمات", height=32,
-                                 fg_color="#2980b9", hover_color="#1a5276",
-                                 command=self._save_config_from_ui)
-        btn_save.grid(row=7, column=0, padx=12, pady=(4, 12), sticky="ew")
+        ctk.CTkButton(box, text="💾  ذخیره تنظیمات", height=32,
+                      fg_color="#1a5276", hover_color="#154360",
+                      command=self._save_config_from_ui).grid(
+            row=8, column=0, padx=14, pady=(4,14), sticky="ew")
 
-        # ── action buttons ──────────────────────────────────────────────────
-        self.btn_scan = ctk.CTkButton(sb, text="🔍 اسکن دامنه‌ها", height=40,
-                                      fg_color="#16a085", hover_color="#0e6655",
+        # ── دکمه‌های عملیاتی ─────────────────────────────────────────────────
+        self.btn_scan = ctk.CTkButton(sb, text="🔍  شروع اسکن", height=40,
+                                      fg_color="#117a65", hover_color="#0e6655",
+                                      font=ctk.CTkFont(size=13, weight="bold"),
                                       command=self._toggle_scan)
-        self.btn_scan.grid(row=3, column=0, padx=16, pady=(16, 4), sticky="ew")
+        self.btn_scan.grid(row=3, column=0, padx=14, pady=(14,4), sticky="ew")
 
-        btn_import = ctk.CTkButton(sb, text="📂 بارگذاری لیست SNI", height=34,
-                                   fg_color="#555", hover_color="#333",
-                                   command=self._import_sni_list)
-        btn_import.grid(row=4, column=0, padx=16, pady=4, sticky="ew")
+        ctk.CTkButton(sb, text="📂  بارگذاری لیست دامنه", height=34,
+                      fg_color="#2c3e50", hover_color="#1a252f",
+                      command=self._import_list).grid(
+            row=4, column=0, padx=14, pady=4, sticky="ew")
 
-        btn_clear = ctk.CTkButton(sb, text="🗑️ پاک‌کردن لاگ", height=34,
-                                  fg_color="#555", hover_color="#333",
-                                  command=self._clear_logs)
-        btn_clear.grid(row=5, column=0, padx=16, pady=4, sticky="ew")
+        ctk.CTkButton(sb, text="📋  کپی نتایج اسکن", height=34,
+                      fg_color="#2c3e50", hover_color="#1a252f",
+                      command=self._copy_results).grid(
+            row=5, column=0, padx=14, pady=4, sticky="ew")
 
-        self.ip_lbl = ctk.CTkLabel(sb, text=f"🖥️ IP محلی:\n{get_local_ip()}",
+        ctk.CTkButton(sb, text="💾  ذخیره نتایج (TXT)", height=34,
+                      fg_color="#2c3e50", hover_color="#1a252f",
+                      command=self._export_results).grid(
+            row=6, column=0, padx=14, pady=4, sticky="ew")
+
+        ctk.CTkButton(sb, text="🗑️  پاک‌کردن لاگ", height=30,
+                      fg_color="#1a1a1a", hover_color="#111",
+                      command=self._clear_logs).grid(
+            row=7, column=0, padx=14, pady=4, sticky="ew")
+
+        self.lbl_ip = ctk.CTkLabel(sb, text=f"🖥️  IP شما:\n{get_local_ip()}",
                                    font=ctk.CTkFont(size=12, weight="bold"),
                                    text_color="#2ecc71")
-        self.ip_lbl.grid(row=6, column=0, padx=20, pady=16)
+        self.lbl_ip.grid(row=8, column=0, pady=12)
 
-        self.btn_toggle = ctk.CTkButton(sb, text="▶️ راه‌اندازی پروکسی", height=52,
-                                        fg_color="#27ae60", hover_color="#1e8449",
-                                        font=ctk.CTkFont(size=14, weight="bold"),
-                                        command=self.toggle_proxy)
-        self.btn_toggle.grid(row=7, column=0, padx=16, pady=(8, 24), sticky="sew")
-        sb.grid_rowconfigure(7, weight=1)
+        self.btn_proxy = ctk.CTkButton(sb, text="▶️  راه‌اندازی پروکسی", height=54,
+                                       fg_color="#1e8449", hover_color="#145a32",
+                                       font=ctk.CTkFont(size=14, weight="bold"),
+                                       command=self.toggle_proxy)
+        self.btn_proxy.grid(row=9, column=0, padx=14, pady=(8,24), sticky="sew")
+        sb.grid_rowconfigure(9, weight=1)
 
-    # ── main area ─────────────────────────────────────────────────────────────
-    def _build_main_area(self):
-        mw = ctk.CTkFrame(self, corner_radius=12, fg_color="#111118")
-        mw.grid(row=0, column=1, padx=16, pady=16, sticky="nsew")
-        mw.grid_rowconfigure(1, weight=2)
-        mw.grid_rowconfigure(3, weight=1)
+    # ═══════════════════════════ MAIN AREA ═══════════════════════════════════
+    def _build_main(self):
+        mw = ctk.CTkFrame(self, corner_radius=12, fg_color="#0e0e18")
+        mw.grid(row=0, column=1, padx=14, pady=14, sticky="nsew")
         mw.grid_columnconfigure(0, weight=1)
+        mw.grid_rowconfigure(1, weight=3)
+        mw.grid_rowconfigure(3, weight=1)
 
-        # status bar
-        self.status_bar = ctk.CTkLabel(mw, text="آماده ─ یک دامنه را اسکن کنید",
-                                       font=ctk.CTkFont(size=11), text_color="#888",
-                                       anchor="w")
-        self.status_bar.grid(row=4, column=0, padx=20, pady=(0, 8), sticky="ew")
-
-        # scanner table
-        ctk.CTkLabel(mw, text="📊 نتایج اسکن TCP",
-                     font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=0, column=0, padx=20, pady=(16, 4), sticky="w")
+        # ── جدول اسکن ────────────────────────────────────────────────────────
+        hdr1 = ctk.CTkFrame(mw, fg_color="transparent")
+        hdr1.grid(row=0, column=0, columnspan=2, padx=18, pady=(14,2), sticky="ew")
+        hdr1.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr1, text="📊  نتایج اسکن TCP",
+                     font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.lbl_count = ctk.CTkLabel(hdr1, text="",
+                                      font=ctk.CTkFont(size=11), text_color="#888")
+        self.lbl_count.grid(row=0, column=1, sticky="e")
 
         style = ttk.Style()
         style.theme_use("clam")
+        _bg, _fg, _sel = "#141420", "#e0e0e0", "#1a5276"
+        _hbg, _hfg     = "#1e1e32", "#ffffff"
         style.configure("Treeview",
-                         background="#18181f", foreground="#ecf0f1",
-                         fieldbackground="#18181f", rowheight=36,
-                         font=("Segoe UI", 10))
+                        background=_bg, foreground=_fg, fieldbackground=_bg,
+                        rowheight=34, font=("Segoe UI", 10), borderwidth=0)
         style.configure("Treeview.Heading",
-                         background="#2d2d3d", foreground="#ccc",
-                         relief="flat", font=("Segoe UI", 10, "bold"))
-        style.map("Treeview", background=[("selected", "#2980b9")])
+                        background=_hbg, foreground=_hfg,
+                        relief="flat", font=("Segoe UI", 10, "bold"))
+        style.map("Treeview",
+                  background=[("selected", _sel)],
+                  foreground=[("selected", "#fff")])
 
-        cols = ("sni", "ip", "provider", "ping", "status")
-        self.scan_tree = ttk.Treeview(mw, columns=cols, show="headings", height=9)
-        headers = {"sni": "دامنه (SNI)", "ip": "IP حل‌شده",
-                   "provider": "زیرساخت", "ping": "تأخیر TCP", "status": "کیفیت"}
-        widths  = {"sni": 230, "ip": 140, "provider": 220, "ping": 100, "status": 130}
-        anchors = {"sni": "w",  "ip": "center", "provider": "w", "ping": "center", "status": "center"}
+        cols = ("sni","ip","provider","ping","status")
+        self.tree = ttk.Treeview(mw, columns=cols, show="headings",
+                                 selectmode="extended")
+        hdrs   = {"sni":"دامنه (SNI)","ip":"IP","provider":"زیرساخت",
+                  "ping":"تأخیر","status":"کیفیت"}
+        widths = {"sni":230,"ip":130,"provider":210,"ping":90,"status":110}
+        anchors= {"sni":"w","ip":"center","provider":"w","ping":"center","status":"center"}
         for c in cols:
-            self.scan_tree.heading(c, text=headers[c],
-                                   command=lambda _c=c: self._sort_tree(_c))
-            self.scan_tree.column(c, width=widths[c], anchor=anchors[c])
+            self.tree.heading(c, text=hdrs[c],
+                              command=lambda _c=c: self._sort_col(_c, False))
+            self.tree.column(c, width=widths[c], anchor=anchors[c], minwidth=60)
 
-        vsb1 = ttk.Scrollbar(mw, orient="vertical", command=self.scan_tree.yview)
-        self.scan_tree.configure(yscrollcommand=vsb1.set)
-        self.scan_tree.grid(row=1, column=0, padx=(20, 0), pady=4, sticky="nsew")
-        vsb1.grid(row=1, column=1, pady=4, sticky="ns")
-        self.scan_tree.bind("<<TreeviewSelect>>", self._on_item_select)
-        self.scan_tree.tag_configure("excellent", foreground="#00e676")
-        self.scan_tree.tag_configure("good",      foreground="#69f0ae")
-        self.scan_tree.tag_configure("slow",      foreground="#ffd740")
-        self.scan_tree.tag_configure("offline",   foreground="#ff5252")
+        vsb = ttk.Scrollbar(mw, orient="vertical",   command=self.tree.yview)
+        hsb = ttk.Scrollbar(mw, orient="horizontal",  command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=1, column=0, padx=(18,0), pady=0, sticky="nsew")
+        vsb.grid(row=1, column=1, sticky="ns", pady=0)
+        hsb.grid(row=2, column=0, sticky="ew", padx=(18,0))
 
-        # log table
-        ctk.CTkLabel(mw, text="🛠️ لاگ موتور",
-                     font=ctk.CTkFont(size=13, weight="bold")).grid(
-            row=2, column=0, padx=20, pady=(12, 4), sticky="w")
+        self.tree.tag_configure("excellent", foreground="#00e5ff")
+        self.tree.tag_configure("good",      foreground="#69f0ae")
+        self.tree.tag_configure("slow",      foreground="#ffd740")
+        self.tree.tag_configure("offline",   foreground="#ff5252")
 
-        self.log_tree = ttk.Treeview(mw, columns=("T","L","S","M"), show="headings", height=7)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Control-c>",        lambda _: self._copy_selected())
+        self.tree.bind("<Button-3>",         self._right_click)
+
+        # ── منوی راست‌کلیک ───────────────────────────────────────────────────
+        self._ctx = tk.Menu(self, tearoff=0, bg="#1e1e2e", fg="white",
+                            activebackground="#2980b9", activeforeground="white",
+                            font=("Segoe UI", 10))
+        self._ctx.add_command(label="✅  انتخاب به عنوان پروکسی",  command=self._ctx_select)
+        self._ctx.add_command(label="📋  کپی ردیف انتخابی",         command=self._copy_selected)
+        self._ctx.add_command(label="📋  کپی فقط دامنه‌ها",          command=self._copy_domains)
+        self._ctx.add_command(label="📋  کپی فقط IP‌ها",             command=self._copy_ips)
+        self._ctx.add_separator()
+        self._ctx.add_command(label="🗑️  حذف ردیف‌های آفلاین",       command=self._remove_offline)
+
+        # ── لاگ ──────────────────────────────────────────────────────────────
+        ctk.CTkLabel(mw, text="🛠️  لاگ موتور",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=3, column=0, padx=18, pady=(8,2), sticky="w", columnspan=2)
+
+        self.log_tree = ttk.Treeview(mw, columns=("T","L","S","M"),
+                                     show="headings", height=6)
         self.log_tree.heading("T", text="زمان")
         self.log_tree.heading("L", text="سطح")
         self.log_tree.heading("S", text="منبع")
         self.log_tree.heading("M", text="پیام")
-        self.log_tree.column("T", width=80,  anchor="center")
-        self.log_tree.column("L", width=75,  anchor="center")
-        self.log_tree.column("S", width=95,  anchor="center")
-        self.log_tree.column("M", width=600, anchor="w")
+        self.log_tree.column("T", width=75,  anchor="center")
+        self.log_tree.column("L", width=70,  anchor="center")
+        self.log_tree.column("S", width=85,  anchor="center")
+        self.log_tree.column("M", width=700, anchor="w")
 
-        vsb2 = ttk.Scrollbar(mw, orient="vertical", command=self.log_tree.yview)
-        self.log_tree.configure(yscrollcommand=vsb2.set)
-        self.log_tree.grid(row=3, column=0, padx=(20, 0), pady=(0, 4), sticky="nsew")
-        vsb2.grid(row=3, column=1, pady=(0, 4), sticky="ns")
+        lvsb = ttk.Scrollbar(mw, orient="vertical", command=self.log_tree.yview)
+        self.log_tree.configure(yscrollcommand=lvsb.set)
+        self.log_tree.grid(row=4, column=0, padx=(18,0), pady=(0,4), sticky="nsew")
+        lvsb.grid(row=4, column=1, pady=(0,4), sticky="ns")
 
         self.log_tree.tag_configure("ERROR",   foreground="#ff5252")
         self.log_tree.tag_configure("SUCCESS", foreground="#69f0ae")
         self.log_tree.tag_configure("WARNING", foreground="#ffd740")
+        mw.grid_rowconfigure(4, weight=1)
 
-    # ── config helpers ────────────────────────────────────────────────────────
-    def _config_path(self) -> str:
-        return os.path.join(get_exe_dir(), "config.json")
+        # ── نوار وضعیت ───────────────────────────────────────────────────────
+        self.lbl_status = ctk.CTkLabel(mw, text="آماده ─ روی «شروع اسکن» کلیک کنید",
+                                       font=ctk.CTkFont(size=11), text_color="#556",
+                                       anchor="w")
+        self.lbl_status.grid(row=5, column=0, columnspan=2, padx=18, pady=(0,8), sticky="ew")
 
-    def _load_config(self) -> dict:
+    # ═══════════════════════════ CONFIG ══════════════════════════════════════
+    def _cfg_path(self): return os.path.join(get_exe_dir(), "config.json")
+
+    def _load_cfg(self) -> dict:
+        defaults = {"LISTEN_HOST":"0.0.0.0","LISTEN_PORT":40443,
+                    "CONNECT_IP":"104.19.229.21","CONNECT_PORT":443,
+                    "FAKE_SNI":"hcaptcha.com"}
         try:
-            with open(self._config_path()) as f:
-                return json.load(f)
+            with open(self._cfg_path()) as f:
+                return {**defaults, **json.load(f)}
         except (OSError, json.JSONDecodeError):
-            return {"LISTEN_HOST": "0.0.0.0", "LISTEN_PORT": 40443,
-                    "CONNECT_IP": "188.114.98.0", "CONNECT_PORT": 443,
-                    "FAKE_SNI": "auth.vercel.com"}
+            return defaults
 
-    def _save_config(self, cfg: dict):
+    def _save_cfg(self, cfg: dict):
         try:
-            with open(self._config_path(), "w") as f:
+            with open(self._cfg_path(), "w") as f:
                 json.dump(cfg, f, indent=4)
         except OSError as e:
             messagebox.showerror("خطا", f"ذخیره config.json ناموفق:\n{e}")
 
     def _load_config_to_ui(self):
-        cfg = self._load_config()
-        for entry, key in [(self.entry_sni, "FAKE_SNI"),
-                           (self.entry_ip,  "CONNECT_IP"),
-                           (self.entry_port,"LISTEN_PORT")]:
-            entry.delete(0, tk.END)
-            entry.insert(0, str(cfg.get(key, "")))
+        cfg = self._load_cfg()
+        for attr, key in [("e_sni","FAKE_SNI"),("e_ip","CONNECT_IP"),("e_port","LISTEN_PORT")]:
+            w = getattr(self, attr)
+            w.delete(0, tk.END)
+            w.insert(0, str(cfg.get(key,"")))
 
     def _save_config_from_ui(self):
-        cfg = self._load_config()
-        sni  = self.entry_sni.get().strip()
-        ip   = self.entry_ip.get().strip()
-        port = self.entry_port.get().strip()
-        if sni:  cfg["FAKE_SNI"]    = sni
-        if ip:   cfg["CONNECT_IP"]  = ip
+        cfg = self._load_cfg()
+        sni  = self.e_sni.get().strip()
+        ip   = self.e_ip.get().strip()
+        port = self.e_port.get().strip()
+        if sni:  cfg["FAKE_SNI"]   = sni
+        if ip:   cfg["CONNECT_IP"] = ip
         if port:
             try:   cfg["LISTEN_PORT"] = int(port)
             except ValueError:
-                messagebox.showwarning("خطا", "پورت باید عدد صحیح باشد.")
-                return
-        self._save_config(cfg)
-        gui_log("Config", f"تنظیمات ذخیره شد: SNI={cfg['FAKE_SNI']} IP={cfg['CONNECT_IP']}", "SUCCESS")
+                messagebox.showwarning("خطا", "پورت باید عدد باشد"); return
+        self._save_cfg(cfg)
+        gui_log("Config", f"ذخیره شد ← SNI={cfg['FAKE_SNI']}  IP={cfg['CONNECT_IP']}", "SUCCESS")
 
-    # ── scan ──────────────────────────────────────────────────────────────────
+    # ═══════════════════════════ SCAN ════════════════════════════════════════
     def _toggle_scan(self):
         if self._scan_thread and self._scan_thread.is_alive():
             self._stop_scan.set()
-            self.btn_scan.configure(text="🔍 اسکن دامنه‌ها", state="normal")
+            self.btn_scan.configure(text="🔍  شروع اسکن",
+                                    fg_color="#117a65", hover_color="#0e6655")
         else:
             self._stop_scan.clear()
-            self.btn_scan.configure(text="⏹ توقف اسکن", fg_color="#c0392b", hover_color="#922b21")
-            for i in self.scan_tree.get_children():
-                self.scan_tree.delete(i)
+            self._scan_results.clear()
+            for i in self.tree.get_children(): self.tree.delete(i)
+            self.lbl_count.configure(text="")
+            self.btn_scan.configure(text="⏹  توقف اسکن",
+                                    fg_color="#922b21", hover_color="#7b241c")
             self._scan_thread = threading.Thread(target=self._run_scan, daemon=True)
             self._scan_thread.start()
 
@@ -374,224 +419,292 @@ class ModernProxyGUI(ctk.CTk):
         path = os.path.join(get_exe_dir(), "sni_list.txt")
         if not os.path.exists(path):
             with open(path, "w") as f:
-                f.write("auth.vercel.com\ndiscord.com\ncloudflare.com\n")
-        with open(path) as f:
+                f.write("hcaptcha.com\ndiscord.com\ncloudflare.com\n")
+
+        with open(path, encoding="utf-8", errors="ignore") as f:
             snis = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
-        gui_log("Scanner", f"شروع اسکن TCP برای {len(snis)} دامنه…", "INFO")
-        self._set_status(f"در حال اسکن {len(snis)} دامنه…")
+        total = len(snis)
+        gui_log("Scanner", f"اسکن موازی {total} دامنه با {SCAN_WORKERS} thread…", "INFO")
+        self._set_status(f"در حال اسکن {total} دامنه…")
 
-        for i, sni in enumerate(snis, 1):
+        done   = [0]
+        lock   = threading.Lock()
+
+        def scan_one(sni):
             if self._stop_scan.is_set():
-                break
+                return
             try:
                 ip       = socket.gethostbyname(sni)
                 provider = detect_provider(ip)
-                ping     = get_tcp_ping(ip)
-                quality  = quality_label(ping)
-                ping_str = f"{ping} ms" if ping < 999 else "---"
-                tag = ("excellent" if ping <= QUALITY_THRESHOLDS["excellent"] else
-                       "good"      if ping <= QUALITY_THRESHOLDS["good"]      else
-                       "slow"      if ping <= QUALITY_THRESHOLDS["slow"]      else
-                       "offline")
-                self.after(0, self._add_scan_row, sni, ip, provider, ping_str, quality, tag)
+                ping     = tcp_ping(ip)
             except OSError:
-                self.after(0, self._add_scan_row, sni, "ناشناخته", "—", "---", "🚫 مسدود", "offline")
+                ip, provider, ping = "خطا", "—", 999
 
-            self.after(0, self._set_status, f"اسکن شد: {i}/{len(snis)}")
+            tag      = ping_tag(ping)
+            qlabel   = ping_label(ping)
+            ping_str = f"{ping} ms" if ping < 999 else "---"
+            row      = {"sni":sni,"ip":ip,"provider":provider,
+                        "ping":ping,"ping_str":ping_str,"quality":qlabel,"tag":tag}
 
-        gui_log("Scanner", "اسکن TCP به پایان رسید.", "SUCCESS")
-        self.after(0, self._set_status, f"اسکن کامل شد — {len(snis)} دامنه بررسی شد")
-        self.after(0, lambda: self.btn_scan.configure(
-            text="🔍 اسکن دامنه‌ها", fg_color="#16a085", hover_color="#0e6655", state="normal"))
+            with lock:
+                self._scan_results.append(row)
+                done[0] += 1
+                d = done[0]
 
-    def _add_scan_row(self, sni, ip, provider, ping_str, quality, tag=""):
+            self.after(0, self._add_row, sni, ip, provider, ping_str, qlabel, tag)
+            if d % 10 == 0 or d == total:
+                self.after(0, self._set_status,
+                           f"اسکن شد: {d} / {total}  —  فشار دهید Ctrl+C برای کپی")
+                self.after(0, self.lbl_count.configure,
+                           {"text": f"{d} / {total}"})
+
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            ex.map(scan_one, snis)
+
+        gui_log("Scanner", f"اسکن کامل شد — {total} دامنه بررسی شد.", "SUCCESS")
+        self.after(0, self._set_status,
+                   f"✅ اسکن کامل — {total} دامنه  |  کلیک راست برای گزینه‌ها")
+        self.after(0, self.lbl_count.configure, {"text": f"{total} / {total}"})
+        self.after(0, self.btn_scan.configure,
+                   {"text":"🔍  شروع اسکن","fg_color":"#117a65","hover_color":"#0e6655"})
+
+    def _add_row(self, sni, ip, provider, ping_str, quality, tag):
         try:
-            self.scan_tree.insert("", tk.END, values=(sni, ip, provider, ping_str, quality), tags=(tag,))
+            self.tree.insert("", tk.END,
+                             values=(sni, ip, provider, ping_str, quality),
+                             tags=(tag,))
         except tk.TclError:
             pass
 
-    def _sort_tree(self, col):
-        rows = [(self.scan_tree.set(k, col), k) for k in self.scan_tree.get_children("")]
-        rows.sort(key=lambda x: (x[0].replace(" ms","").strip() if x[0].replace(" ms","").strip().isdigit()
-                                 else x[0].lower()))
+    def _sort_col(self, col, reverse):
+        rows = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+        try:
+            rows.sort(key=lambda x: int(x[0].replace(" ms","").strip()), reverse=reverse)
+        except ValueError:
+            rows.sort(key=lambda x: x[0].lower(), reverse=reverse)
         for i, (_, k) in enumerate(rows):
-            self.scan_tree.move(k, "", i)
+            self.tree.move(k, "", i)
+        self.tree.heading(col, command=lambda: self._sort_col(col, not reverse))
 
-    def _on_item_select(self, _event):
-        sel = self.scan_tree.selection()
-        if not sel:
-            return
-        values = self.scan_tree.item(sel[0])["values"]
-        sni, ip = str(values[0]), str(values[1])
-        if ip in ("ناشناخته", "Unresolved"):
-            return
-        cfg = self._load_config()
-        cfg["FAKE_SNI"]   = sni
-        cfg["CONNECT_IP"] = ip
-        self._save_config(cfg)
-        self.entry_sni.delete(0, tk.END); self.entry_sni.insert(0, sni)
-        self.entry_ip.delete(0, tk.END);  self.entry_ip.insert(0, ip)
-        gui_log("Config", f"انتخاب شد: {sni}  →  {ip}", "SUCCESS")
+    # ═══════════════════════════ SELECTION / COPY ════════════════════════════
+    def _on_select(self, _=None):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0])["values"]
+        sni, ip = str(vals[0]), str(vals[1])
+        if ip in ("خطا","Unresolved"): return
+        cfg = self._load_cfg()
+        cfg["FAKE_SNI"] = sni; cfg["CONNECT_IP"] = ip
+        self._save_cfg(cfg)
+        for attr, val in [("e_sni",sni),("e_ip",ip)]:
+            w = getattr(self, attr)
+            w.delete(0, tk.END); w.insert(0, val)
+        gui_log("Config", f"انتخاب: {sni}  →  {ip}", "SUCCESS")
         self._set_status(f"انتخاب شد: {sni}  ({ip})")
 
-    def _import_sni_list(self):
+    def _ctx_select(self): self._on_select()
+
+    def _right_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if row: self.tree.selection_set(row)
+        self._ctx.post(event.x_root, event.y_root)
+
+    def _selected_values(self):
+        sel = self.tree.selection()
+        if not sel:
+            sel = self.tree.get_children()
+        return [self.tree.item(k)["values"] for k in sel]
+
+    def _copy_selected(self):
+        rows = self._selected_values()
+        text = "\n".join(
+            f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}\t{r[4]}" for r in rows)
+        self._to_clipboard(text)
+        gui_log("Config", f"{len(rows)} ردیف کپی شد.", "SUCCESS")
+
+    def _copy_domains(self):
+        rows = self._selected_values()
+        self._to_clipboard("\n".join(str(r[0]) for r in rows))
+        gui_log("Config", f"{len(rows)} دامنه کپی شد.", "SUCCESS")
+
+    def _copy_ips(self):
+        rows = self._selected_values()
+        self._to_clipboard("\n".join(str(r[1]) for r in rows if str(r[1]) not in ("خطا","")))
+        gui_log("Config", f"{len(rows)} IP کپی شد.", "SUCCESS")
+
+    def _copy_results(self):
+        if not self._scan_results:
+            messagebox.showinfo("کپی", "هنوز نتیجه‌ای وجود ندارد."); return
+        header = "دامنه\tIP\tزیرساخت\tتأخیر\tکیفیت"
+        lines  = [header] + [
+            f"{r['sni']}\t{r['ip']}\t{r['provider']}\t{r['ping_str']}\t{r['quality']}"
+            for r in self._scan_results]
+        self._to_clipboard("\n".join(lines))
+        gui_log("Config", f"همه {len(self._scan_results)} نتیجه کپی شد.", "SUCCESS")
+
+    def _export_results(self):
+        if not self._scan_results:
+            messagebox.showinfo("ذخیره", "هنوز نتیجه‌ای وجود ندارد."); return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text file","*.txt"),("All","*.*")],
+            title="ذخیره نتایج اسکن")
+        if not path: return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("دامنه\tIP\tزیرساخت\tتأخیر\tکیفیت\n")
+            for r in self._scan_results:
+                f.write(f"{r['sni']}\t{r['ip']}\t{r['provider']}\t{r['ping_str']}\t{r['quality']}\n")
+        gui_log("Config", f"نتایج در {os.path.basename(path)} ذخیره شد.", "SUCCESS")
+
+    def _remove_offline(self):
+        removed = 0
+        for k in self.tree.get_children():
+            if "آفلاین" in str(self.tree.item(k)["values"]):
+                self.tree.delete(k); removed += 1
+        gui_log("Scanner", f"{removed} ردیف آفلاین حذف شد.", "INFO")
+
+    def _to_clipboard(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+
+    def _import_list(self):
         path = filedialog.askopenfilename(
-            title="انتخاب فایل لیست SNI",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
-        if not path:
-            return
-        dest = os.path.join(get_exe_dir(), "sni_list.txt")
+            title="انتخاب فایل لیست دامنه",
+            filetypes=[("Text","*.txt"),("All","*.*")])
+        if not path: return
         import shutil
-        shutil.copy(path, dest)
-        gui_log("Config", f"لیست SNI بارگذاری شد از {os.path.basename(path)}", "SUCCESS")
+        shutil.copy(path, os.path.join(get_exe_dir(), "sni_list.txt"))
+        gui_log("Config", f"لیست بارگذاری شد: {os.path.basename(path)}", "SUCCESS")
 
     def _clear_logs(self):
-        for i in self.log_tree.get_children():
-            self.log_tree.delete(i)
+        for i in self.log_tree.get_children(): self.log_tree.delete(i)
 
-    def _set_status(self, text: str):
-        self.status_bar.configure(text=text)
+    def _set_status(self, t: str):
+        self.lbl_status.configure(text=t)
 
-    # ── log poller ────────────────────────────────────────────────────────────
+    # ═══════════════════════════ LOG POLLER ══════════════════════════════════
     def _poll_logs(self):
-        while not log_queue.empty():
-            t, lvl, src, msg = log_queue.get()
-            tag = lvl if lvl in ("ERROR", "SUCCESS", "WARNING") else ""
-            self.log_tree.insert("", 0, values=(t, lvl, src, msg), tags=(tag,))
-            # keep log to 500 rows
-            children = self.log_tree.get_children()
-            if len(children) > 500:
-                self.log_tree.delete(children[-1])
-        self.after(100, self._poll_logs)
+        try:
+            while not log_queue.empty():
+                t, lvl, src, msg = log_queue.get_nowait()
+                tag = lvl if lvl in ("ERROR","SUCCESS","WARNING") else ""
+                self.log_tree.insert("", 0, values=(t,lvl,src,msg), tags=(tag,))
+                ch = self.log_tree.get_children()
+                if len(ch) > 600: self.log_tree.delete(ch[-1])
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_logs)
 
-    # ── proxy ─────────────────────────────────────────────────────────────────
+    # ═══════════════════════════ PROXY ═══════════════════════════════════════
     def toggle_proxy(self):
         global async_loop_running, active_divert_ips
         if not async_loop_running:
-            cfg = self._load_config()
+            cfg      = self._load_cfg()
+            local_ip = get_local_ip()
             async_loop_running = True
-            self.btn_toggle.configure(text="🛑 توقف پروکسی",
-                                      fg_color="#e74c3c", hover_color="#c0392b")
-            target_ip = cfg["CONNECT_IP"]
-            local_ip  = get_local_ip()
-            gui_log("System", f"پروکسی روی پورت {cfg['LISTEN_PORT']} راه‌اندازی شد", "INFO")
-            threading.Thread(target=lambda: asyncio.run(self._run_srv(cfg, local_ip)),
-                              daemon=True).start()
+            self.btn_proxy.configure(text="🛑  توقف پروکسی",
+                                     fg_color="#922b21", hover_color="#7b241c")
+            threading.Thread(
+                target=lambda: asyncio.run(self._run_srv(cfg, local_ip)),
+                daemon=True).start()
 
-            if WINDIVERT_AVAILABLE:
-                if target_ip not in active_divert_ips:
-                    w_filter = (f"tcp and ((ip.SrcAddr == {local_ip} and ip.DstAddr == {target_ip})"
-                                f" or (ip.SrcAddr == {target_ip} and ip.DstAddr == {local_ip}))")
+            if WINDIVERT_OK:
+                tgt = cfg["CONNECT_IP"]
+                if tgt not in active_divert_ips:
+                    wf = (f"tcp and ((ip.SrcAddr=={local_ip} and ip.DstAddr=={tgt})"
+                          f" or (ip.SrcAddr=={tgt} and ip.DstAddr=={local_ip}))")
                     threading.Thread(
-                        target=FakeTcpInjector(w_filter, fake_injective_connections).run,
+                        target=FakeTcpInjector(wf, fake_injective_connections).run,
                         daemon=True).start()
-                    active_divert_ips.add(target_ip)
-                    gui_log("DPI", f"موتور WinDivert برای {target_ip} فعال شد", "SUCCESS")
+                    active_divert_ips.add(tgt)
+                    gui_log("DPI", f"WinDivert فعال برای {tgt}", "SUCCESS")
             else:
-                gui_log("DPI", "ماژول WinDivert یافت نشد! دور زدن DPI ممکن است ناقص باشد.", "WARNING")
+                gui_log("DPI", "WinDivert یافت نشد — DPI bypass ناقص است.", "WARNING")
 
-            gui_log("System", "پروکسی آماده دریافت ترافیک است.", "SUCCESS")
-            self._set_status(f"پروکسی فعال  —  {local_ip}:{cfg['LISTEN_PORT']}  →  {target_ip}")
+            gui_log("System", f"پروکسی روی {local_ip}:{cfg['LISTEN_PORT']} فعال شد.", "SUCCESS")
+            self._set_status(f"پروکسی فعال  ─  {local_ip}:{cfg['LISTEN_PORT']}  →  {cfg['CONNECT_IP']}")
         else:
             async_loop_running = False
             if self.server_socket:
                 try: self.server_socket.close()
-                except OSError: pass
+                except: pass
             fake_injective_connections.clear()
             active_divert_ips.clear()
-            self.btn_toggle.configure(text="▶️ راه‌اندازی پروکسی",
-                                      fg_color="#27ae60", hover_color="#1e8449")
+            self.btn_proxy.configure(text="▶️  راه‌اندازی پروکسی",
+                                     fg_color="#1e8449", hover_color="#145a32")
             gui_log("System", "پروکسی متوقف شد.", "WARNING")
             self._set_status("پروکسی متوقف شد — آماده راه‌اندازی مجدد")
 
-    async def _run_srv(self, config: dict, _ip: str):
+    async def _run_srv(self, config, _):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setblocking(False)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.server_socket.bind((config["LISTEN_HOST"], config["LISTEN_PORT"]))
-            self.server_socket.listen(128)
+            self.server_socket.listen(256)
         except OSError as e:
-            gui_log("System", f"خطای bind: پورت {config['LISTEN_PORT']} احتمالاً در حال استفاده است — {e}", "ERROR")
-            async_loop_running and self.after(0, self.toggle_proxy)
+            gui_log("System", f"خطای bind: پورت {config['LISTEN_PORT']} احتمالاً در استفاده است — {e}", "ERROR")
             return
-
         loop = asyncio.get_running_loop()
         while async_loop_running:
             try:
                 client, addr = await loop.sock_accept(self.server_socket)
-                asyncio.create_task(self._handle_client(client, addr, config))
+                asyncio.create_task(self._handle(client, addr, config))
             except OSError:
-                if async_loop_running:
-                    await asyncio.sleep(0.05)
+                if async_loop_running: await asyncio.sleep(0.05)
 
-    async def _handle_client(self, client: socket.socket, addr, config: dict):
+    async def _handle(self, client, addr, cfg):
         cid = f"{addr[0]}:{addr[1]}"
-        gui_log("Client", f"اتصال جدید از {cid}", "INFO")
-        out_sock: socket.socket | None = None
-        conn = None
+        out_sock = conn = None
         try:
-            loop = asyncio.get_running_loop()
+            loop     = asyncio.get_running_loop()
             out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             out_sock.setblocking(False)
             out_sock.bind((get_local_ip(), 0))
-
             f_data = ClientHelloMaker.get_client_hello_with(
                 os.urandom(32), os.urandom(32),
-                config["FAKE_SNI"].encode(), os.urandom(32))
-
-            if WINDIVERT_AVAILABLE:
+                cfg["FAKE_SNI"].encode(), os.urandom(32))
+            if WINDIVERT_OK:
                 conn = FakeInjectiveConnection(
-                    out_sock, get_local_ip(), config["CONNECT_IP"],
-                    out_sock.getsockname()[1], config["CONNECT_PORT"],
+                    out_sock, get_local_ip(), cfg["CONNECT_IP"],
+                    out_sock.getsockname()[1], cfg["CONNECT_PORT"],
                     f_data, "wrong_seq", client)
                 fake_injective_connections[conn.id] = conn
-
             await asyncio.wait_for(
-                loop.sock_connect(out_sock, (config["CONNECT_IP"], config["CONNECT_PORT"])), 5)
-            gui_log("Proxy", f"[{cid}] متصل شد — SNI spoofing در حال اجرا…", "SUCCESS")
-
-            if WINDIVERT_AVAILABLE and conn:
-                try:
-                    await asyncio.wait_for(conn.t2a_event.wait(), 2)
-                except asyncio.TimeoutError:
-                    gui_log("DPI", f"[{cid}] timeout handshake — ادامه relay…", "WARNING")
+                loop.sock_connect(out_sock, (cfg["CONNECT_IP"], cfg["CONNECT_PORT"])), 5)
+            if WINDIVERT_OK and conn:
+                try:    await asyncio.wait_for(conn.t2a_event.wait(), 2)
+                except asyncio.TimeoutError: pass
                 conn.monitor = False
-
-            gui_log("Relay", f"[{cid}] تونل برقرار شد ⚡", "SUCCESS")
+            gui_log("Relay", f"[{cid}] تونل برقرار ⚡", "SUCCESS")
             task = asyncio.create_task(self._relay(out_sock, client, asyncio.current_task()))
             await self._relay(client, out_sock, task)
-        except asyncio.TimeoutError:
-            gui_log("Proxy", f"[{cid}] اتصال timeout شد.", "ERROR")
-        except OSError as e:
-            gui_log("Proxy", f"[{cid}] اتصال قطع شد: {e}", "ERROR")
+        except (asyncio.TimeoutError, OSError) as e:
+            gui_log("Proxy", f"[{cid}] قطع: {e}", "ERROR")
         finally:
-            if conn and WINDIVERT_AVAILABLE:
+            if conn and WINDIVERT_OK:
                 fake_injective_connections.pop(conn.id, None)
             for s in (out_sock, client):
                 if s:
                     try: s.close()
-                    except OSError: pass
+                    except: pass
 
-    async def _relay(self, src: socket.socket, dst: socket.socket, peer: asyncio.Task):
+    async def _relay(self, src, dst, peer):
         loop = asyncio.get_running_loop()
         try:
             while async_loop_running:
                 data = await loop.sock_recv(src, 65536)
-                if not data:
-                    break
+                if not data: break
                 await loop.sock_sendall(dst, data)
-        except OSError:
-            pass
+        except OSError: pass
         finally:
-            if peer and not peer.done():
-                peer.cancel()
-            try: src.close()
-            except OSError: pass
-            try: dst.close()
-            except OSError: pass
+            if peer and not peer.done(): peer.cancel()
+            for s in (src, dst):
+                try: s.close()
+                except: pass
 
 
 if __name__ == "__main__":
-    ModernProxyGUI().mainloop()
+    App().mainloop()
